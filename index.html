@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIパンチングゲーム</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            font-family: 'Hiragino Kaku Gothic ProN', 'Meiryo', sans-serif;
+            color: white;
+            user-select: none;
+        }
+        #container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        /* 鏡のように左右反転して表示 */
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1);
+        }
+        /* UI部分 */
+        #ui-header {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            display: flex;
+            justify-content: space-between;
+            padding: 20px 50px;
+            box-sizing: border-box;
+            font-size: 32px;
+            font-weight: bold;
+            text-shadow: 3px 3px 5px rgba(0,0,0,0.8);
+            z-index: 10;
+        }
+        #timer { color: #ff4d4d; }
+        #score { color: #ffd700; }
+        
+        #message-area {
+            position: absolute;
+            top: 120px;
+            width: 100%;
+            text-align: center;
+            font-size: 36px;
+            font-weight: bold;
+            text-shadow: 3px 3px 5px rgba(0,0,0,0.8);
+            z-index: 10;
+        }
+        
+        #main-msg {
+            font-size: 50px;
+            color: #00ffff;
+            margin-bottom: 10px;
+        }
+        
+        #sub-msg {
+            font-size: 28px;
+            color: #ffffff;
+        }
+
+        /* ゲームオーバー時の画面 */
+        #game-over-screen {
+            display: none;
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 20;
+        }
+        #game-over-screen h1 {
+            font-size: 70px;
+            color: #ff4d4d;
+            margin-bottom: 20px;
+        }
+        #final-score {
+            font-size: 40px;
+            margin-bottom: 30px;
+        }
+        #retry-msg {
+            font-size: 28px;
+            color: #00ffff;
+            font-weight: bold;
+            text-shadow: 0 0 10px rgba(0,255,255,0.5);
+            animation: blink 1.5s infinite alternate;
+        }
+        @keyframes blink {
+            0% { opacity: 0.4; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+
+    <div id="container">
+        <video id="input_video" style="display:none;" playsinline></video>
+        
+        <canvas id="output_canvas"></canvas>
+
+        <div id="ui-header">
+            <div id="timer">TIME: 60</div>
+            <div id="score">SCORE: 0</div>
+        </div>
+
+        <div id="message-area">
+            <div id="main-msg">手を顔より高く上げてスタート！</div>
+            <div id="sub-msg"></div>
+        </div>
+
+        <div id="game-over-screen">
+            <h1>GAME OVER</h1>
+            <div id="final-score">SCORE: 0</div>
+            <div id="retry-msg">手を顔より高く上げてリトライ！</div>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        
+        const timerEl = document.getElementById('timer');
+        const scoreEl = document.getElementById('score');
+        const mainMsgEl = document.getElementById('main-msg');
+        const subMsgEl = document.getElementById('sub-msg');
+        const gameOverScreen = document.getElementById('game-over-screen');
+        const finalScoreEl = document.getElementById('final-score');
+
+        // ゲームステート
+        // TITLE: 手を上げるのを待つ
+        // WAITING_START_LOWER: 手をあげるのを確認し、下げるのを待つ
+        // PLAYING: ゲーム中
+        // WAITING_NEUTRAL: 正解後、ニュートラルに戻るのを待つ
+        // GAMEOVER: ゲーム終了
+        let gameMode = "TITLE"; 
+        let score = 0;
+        let timeLeft = 60;
+        let timerId = null;
+        
+        // ゲーム終了時刻の記録用（キャンセル時間3秒のため）
+        let gameoverTimestamp = 0;
+        
+        // 出題データ
+        let leftTarget = "GOOD"; // "GOOD" or "BAD"
+        let rightTarget = "GOOD";
+        
+        // 音声合成用のコンテキスト
+        let audioCtx = null;
+
+        // キャンバスサイズの初期化
+        function resizeCanvas() {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+ 
+
+
+       function speak(text) {
+        window.speechSynthesis.cancel();
+        const uttr = new SpeechSynthesisUtterance(text);
+        uttr.lang = 'ja-JP';
+        window.speechSynthesis.speak(uttr);
+    }
+
+
+
+
+        // 正解音（チャイム）を鳴らす関数
+        function playCorrectSound() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            
+            const oscillator = audioCtx.createOscillator();
+            const gainNode = audioCtx.createGain();
+            
+            oscillator.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+            
+            oscillator.type = 'sine';
+            oscillator.frequency.setValueAtTime(1000, audioCtx.currentTime);
+            oscillator.frequency.exponentialRampToValueAtTime(1000, audioCtx.currentTime + 0.1);
+            
+            gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+            
+            oscillator.start();
+            oscillator.stop(audioCtx.currentTime + 0.3);
+        }
+
+        // ゲーム開始
+        function startGame() {
+            gameMode = "PLAYING";
+            score = 0;
+            timeLeft = 60;
+            scoreEl.innerText = `SCORE: ${score}`;
+            timerEl.innerText = `TIME: ${timeLeft}`;
+            
+            spawnQuestion();
+            
+            timerId = setInterval(() => {
+                timeLeft--;
+                timerEl.innerText = `TIME: ${timeLeft}`;
+                if (timeLeft <= 0) {
+                    endGame();
+                }
+            }, 1000);
+        }
+
+        // 次の問題を生成
+        function spawnQuestion() {
+            const types = ["GOOD", "BAD"];
+            leftTarget = types[Math.floor(Math.random() * 2)];
+            rightTarget = types[Math.floor(Math.random() * 2)];
+            
+            gameMode = "PLAYING";
+            mainMsgEl.innerText = "ターゲット出現！";
+            mainMsgEl.style.color = "#00ffff";
+            subMsgEl.style.color = "#ff0000";
+            subMsgEl.innerText = "悪魔をパンチ！天使はだめよ";
+        }
+
+        // ゲーム終了
+        function endGame() {
+            clearInterval(timerId);
+            gameMode = "GAMEOVER";
+            mainMsgEl.innerText = "タイムアップ！";
+            subMsgEl.innerText = "";
+            
+            finalScoreEl.innerText = `最終スコア: ${score}点`;
+            gameOverScreen.style.display = "flex";
+            
+            // ゲームが終了した現在の時刻を記録
+            gameoverTimestamp = Date.now();
+            speak(`終了。得点は${score}点です。`);
+
+            //speak("終了しました");
+        }
+
+        // MediaPipe ポーズ検出のコールバック
+        function onResults(results) {
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            // カメラ映像の描画
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            if (results.poseLandmarks) {
+                const landmarks = results.poseLandmarks;
+
+                // 必要な部位のインデックス
+                // 0: 鼻, 15: 左手首, 16: 右手首
+                const nose = landmarks[0];
+                const leftWrist = landmarks[15];
+                const rightWrist = landmarks[16];
+
+                // *注意*: カメラの生データ座標は、ユーザーが鏡を見たときと左右が逆です。
+                // 画面左側（右手の動作）、画面右側（左手の動作）として処理します。
+                
+                // パンチ判定（手首が鼻の位置より上にある）
+                const leftPunch = leftWrist.y < nose.y;
+                const rightPunch = rightWrist.y < nose.y;
+
+                // パンチしていない状態（手首が鼻の位置より下にある）
+                const leftPulled = leftWrist.y > nose.y;
+                const rightPulled = rightWrist.y > nose.y;
+
+                // 手首が交差している判定（手首が鼻より低い、かつ左右の手首が入れ替わっている）
+                // 通常は左手首のX座標 > 右手首のX座標
+                const crossed = leftWrist.x < rightWrist.x && leftPulled && rightPulled;
+
+                // 1-A. スタート判定（最初の起動時：手をあげるのを待つ）
+                if (gameMode === "TITLE") {
+                    if (leftPunch || rightPunch) {
+                        gameMode = "WAITING_START_LOWER";
+                        mainMsgEl.innerText = "手を下げてスタート！";
+                        mainMsgEl.style.color = "#ffff00";
+                        subMsgEl.innerText = "";
+                    }
+                }
+                // 1-B. リトライ判定（ゲームオーバー時：手をあげるのを待つ）
+                else if (gameMode === "GAMEOVER") {
+                    // 現在時刻と終了時刻の差を計算（ミリ秒）
+                    const timeSinceGameover = Date.now() - gameoverTimestamp;
+                    
+                    // 3秒（3000ミリ秒）以上経過している場合のみ判定を行う
+                    if (timeSinceGameover > 3000) {
+                        if (leftPunch || rightPunch) {
+                            gameOverScreen.style.display = "none";
+                            gameMode = "WAITING_START_LOWER";
+                            mainMsgEl.innerText = "手を下げてスタート！";
+                            mainMsgEl.style.color = "#ffff00";
+                            subMsgEl.innerText = "";
+                        }
+                    }
+                }
+                // スタート判定（第二段階：手を下げるのを待つ）
+                else if (gameMode === "WAITING_START_LOWER") {
+                    if (leftPulled && rightPulled) {
+                        startGame();
+                        speak("スタート"); 
+ 
+                    }
+                }
+
+                // 2. プレイ中のアクション判定
+                if (gameMode === "PLAYING") {
+                    let success = false;
+
+                    const L = leftTarget;
+                    const R = rightTarget;
+
+                    if (L === "BAD" && R === "BAD") {
+                        if (leftPunch && rightPunch) success = true;
+                    } else if (L === "BAD" && R === "GOOD") {
+                        if (leftPunch && rightPulled && !crossed) success = true;
+                    } else if (L === "GOOD" && R === "BAD") {
+                        if (leftPulled && rightPunch && !crossed) success = true;
+                    } else if (L === "GOOD" && R === "GOOD") {
+                        if (crossed) success = true;
+                    }
+
+                    if (success) {
+                        score++;
+                        scoreEl.innerText = `SCORE: ${score}`;
+                        playCorrectSound();
+                        
+                        mainMsgEl.innerText = "✨正解！✨";
+                        mainMsgEl.style.color = "#ffff00";
+                        subMsgEl.innerText = "手をさげて元に戻してください";
+                        
+                        gameMode = "WAITING_NEUTRAL";
+                    }
+                } 
+                // 3. ニュートラル（構え）戻り待ち
+                else if (gameMode === "WAITING_NEUTRAL") {
+                    // 両手を引いて、かつ交差していない状態
+                    if (leftPulled && rightPulled && !crossed) {
+                        spawnQuestion();
+                    }
+                }
+            }
+
+            canvasCtx.restore();
+
+            // ターゲット（顔）の描画
+            if (gameMode === "PLAYING" || gameMode === "WAITING_NEUTRAL") {
+                const isNeutral = (gameMode === "WAITING_NEUTRAL");
+                drawFace(leftTarget, canvasElement.width * 0.75, canvasElement.height * 0.5, isNeutral); // 画面右側（左手対応）
+                drawFace(rightTarget, canvasElement.width * 0.25, canvasElement.height * 0.5, isNeutral); // 画面左側（右手対応）
+            }
+        }
+
+        // 絵文字（顔）を描画する関数
+        function drawFace(type, x, y, isNeutral) {
+            if (isNeutral) return;
+
+            canvasCtx.save();
+            canvasCtx.translate(canvasElement.width, 0);
+            canvasCtx.scale(-1, 1);
+            
+            const flippedX = canvasElement.width - x;
+
+            // 背景の円
+            canvasCtx.beginPath();
+            canvasCtx.arc(flippedX, y, 115, 0, Math.PI * 2);
+            canvasCtx.fillStyle = type === "BAD" ? "rgba(255, 0, 0, 0.6)" : "rgba(0, 255, 0, 0.6)";
+            canvasCtx.fill();
+            canvasCtx.lineWidth = 5;
+            canvasCtx.strokeStyle = "#ffffff";
+            canvasCtx.stroke();
+
+            // 絵文字テキスト
+            canvasCtx.font = "180px Arial";
+            canvasCtx.textAlign = "center";
+            canvasCtx.textBaseline = "middle";
+            canvasCtx.fillText(type === "BAD" ? "😈" : "😇", flippedX, y);
+            
+            canvasCtx.restore();
+        }
+
+        // MediaPipe Pose の設定
+        const pose = new Pose({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
+        }});
+        
+        pose.setOptions({
+            modelComplexity: 1,
+            smoothLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        
+        pose.onResults(onResults);
+
+        // カメラの設定
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await pose.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+        camera.start();
+    </script>
+</body>
+</html>
